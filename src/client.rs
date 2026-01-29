@@ -12,8 +12,10 @@ use crate::{
     generation::{ContentBuilder, GenerateContentRequest, GenerationResponse},
 };
 use eventsource_stream::{EventStreamError, Eventsource};
+use flate2::{write::GzEncoder, Compression};
 use futures::{Stream, StreamExt, TryStreamExt};
 use mime::Mime;
+use std::io::Write;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue},
     Client, ClientBuilder, RequestBuilder, Response,
@@ -348,17 +350,54 @@ impl GeminiClient {
     /// Perform a POST request with JSON body and deserialize the JSON response.
     ///
     /// This is a convenience wrapper around [`perform_request`](Self::perform_request).
+    /// Minimum size in bytes to apply gzip compression (1KB)
+    const COMPRESSION_THRESHOLD: usize = 1024;
+
     #[tracing::instrument(skip(self, body), fields(request.type = "post", request.url = %url))]
     async fn post_json<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
         &self,
         url: Url,
         body: &Req,
     ) -> Result<Res, Error> {
-        self.perform_request(
-            |c| c.post(url).json(body),
-            async |r| r.json().await.context(DecodeResponseSnafu),
-        )
-        .await
+        // Serialize to JSON
+        let json_bytes = serde_json::to_vec(body).unwrap_or_default();
+        let original_size = json_bytes.len();
+
+        // Only compress if above threshold
+        if original_size >= Self::COMPRESSION_THRESHOLD {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&json_bytes).unwrap();
+            let compressed_bytes = encoder.finish().unwrap();
+            let compressed_size = compressed_bytes.len();
+
+            tracing::debug!(
+                original_bytes = original_size,
+                compressed_bytes = compressed_size,
+                compression_ratio = format!("{:.1}%", (1.0 - (compressed_size as f64 / original_size as f64)) * 100.0),
+                "request body compressed with gzip"
+            );
+
+            self.perform_request(
+                |c| c.post(url)
+                    .header("Content-Encoding", "gzip")
+                    .header("Content-Type", "application/json")
+                    .body(compressed_bytes),
+                async |r| r.json().await.context(DecodeResponseSnafu),
+            )
+            .await
+        } else {
+            tracing::trace!(
+                original_bytes = original_size,
+                threshold = Self::COMPRESSION_THRESHOLD,
+                "request body below compression threshold"
+            );
+
+            self.perform_request(
+                |c| c.post(url).json(body),
+                async |r| r.json().await.context(DecodeResponseSnafu),
+            )
+            .await
+        }
     }
 
     /// Generate content
@@ -412,12 +451,45 @@ impl GeminiClient {
         let mut url = self.build_url("streamGenerateContent")?;
         url.query_pairs_mut().append_pair("alt", "sse");
 
-        let stream = self
-            .perform_request(
+        // Serialize request body
+        let json_bytes = serde_json::to_vec(&request).unwrap_or_default();
+        let original_size = json_bytes.len();
+
+        // Only compress if above threshold
+        let stream = if original_size >= Self::COMPRESSION_THRESHOLD {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&json_bytes).unwrap();
+            let compressed_bytes = encoder.finish().unwrap();
+            let compressed_size = compressed_bytes.len();
+
+            tracing::debug!(
+                original_bytes = original_size,
+                compressed_bytes = compressed_size,
+                compression_ratio = format!("{:.1}%", (1.0 - (compressed_size as f64 / original_size as f64)) * 100.0),
+                "stream request body compressed with gzip"
+            );
+
+            self.perform_request(
+                |c| c.post(url)
+                    .header("Content-Encoding", "gzip")
+                    .header("Content-Type", "application/json")
+                    .body(compressed_bytes),
+                async |r| Ok(r.bytes_stream()),
+            )
+            .await?
+        } else {
+            tracing::trace!(
+                original_bytes = original_size,
+                threshold = Self::COMPRESSION_THRESHOLD,
+                "stream request body below compression threshold"
+            );
+
+            self.perform_request(
                 |c| c.post(url).json(&request),
                 async |r| Ok(r.bytes_stream()),
             )
-            .await?;
+            .await?
+        };
 
         Ok(Box::pin(
             stream
